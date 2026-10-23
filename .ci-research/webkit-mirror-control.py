@@ -90,8 +90,10 @@ def verify(mode):
     else:
         assert not requests, 'Prepared install must bypass the delayed Azure mirror entirely'
         assert 'https://archive.ubuntu.com/ubuntu' in (root / 'install.log').read_text()
-    assert not [row for row in events if row['phase'] == 'error']
-    (root / 'mirror-review.json').write_text(json.dumps({'mode': mode, 'requests': len(requests), 'dependencyPackagesServed': len(debs), 'controlledDelaySeconds': max([row['controlledDelaySeconds'] for row in requests], default=0), 'source': os.environ['CONTROL_SOURCE'], 'kind': 'Controlled delayed mirror, not a natural day-wide performance sample'}, indent=2))
+    errors = [row for row in events if row['phase'] == 'error']
+    expired_clients = [row for row in errors if mode == 'baseline' and row['error'] == '[Errno 32] Broken pipe']
+    assert all(row in expired_clients for row in errors), 'Unexpected proxy transport failure'
+    (root / 'mirror-review.json').write_text(json.dumps({'mode': mode, 'requests': len(requests), 'dependencyPackagesServed': len(debs), 'controlledDelaySeconds': max([row['controlledDelaySeconds'] for row in requests], default=0), 'source': os.environ['CONTROL_SOURCE'], 'expiredDelayedClients': len(expired_clients), 'kind': 'Controlled delayed mirror, not a natural day-wide performance sample'}, indent=2))
 
 if __name__ == '__main__':
     if sys.argv[1] == 'configure':

@@ -7,6 +7,11 @@ on:
       - config/scripts/benchmark-preflight-*.mjs
       - config/scripts/preflight-benchmark-command.mjs
   workflow_dispatch:
+    inputs:
+      preparations:
+        description: Diagnostic matrix; baseline-only reuses the passing prepared reference.
+        default: '["baseline", "prepared"]'
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -25,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preparation: [baseline, prepared]
+        preparation: ${{ fromJSON(inputs.preparations || '["baseline", "prepared"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
