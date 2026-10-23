@@ -14,98 +14,83 @@ concurrency:
   cancel-in-progress: true
 env:
   ORCA_BACKGROUND_LAUNCH: '1'
+  CONTROL_SOURCE: a4a0e605eef4a3864b572213f81c17ecb26ded2c
 jobs:
-  compilers:
+  producer:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    # Native compiler peaks can exhaust the standard ARM runner before samples are saved.
-    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
-    timeout-minutes: 25
+    name: SSH producer (${{ matrix.pool }}, ${{ matrix.replica }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pool: github, runner: ubuntu-latest, replica: 1 }
+          - { pool: github, runner: ubuntu-latest, replica: 2 }
+          - { pool: blacksmith, runner: blacksmith-4vcpu-ubuntu-2404, replica: 1 }
+          - { pool: blacksmith, runner: blacksmith-4vcpu-ubuntu-2404, replica: 2 }
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.CONTROL_SOURCE }}
           persist-credentials: false
+      - name: Record exact tested source
+        env:
+          CONTROL_POOL: ${{ matrix.pool }}
+          CONTROL_REPLICA: ${{ matrix.replica }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          mkdir -p .build/ssh-producer-control
+          git rev-parse HEAD > .build/ssh-producer-control/source.txt
+          printf '%s\n' "$CONTROL_POOL" > .build/ssh-producer-control/pool.txt
+          printf '%s\n' "$CONTROL_REPLICA" > .build/ssh-producer-control/replica.txt
+          sha256sum pnpm-lock.yaml mobile/pnpm-lock.yaml > .build/ssh-producer-control/lockfiles.txt
       - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare native and Bun typechecking
-        run: node config/scripts/benchmark-preflight-compilers.mjs
+      - uses: ./.github/actions/build-mobile-web-bundle
+      - name: Verify the actual bundle and save its content manifest
+        run: |
+          node -e "require('./config/scripts/verify-packaged-mobile-web-bundle.cjs').assertMobileWebBundleBuilt()"
+          node --version > .build/ssh-producer-control/node-version.txt
+          cp out/mobile-web/manifest.json .build/ssh-producer-control/manifest.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: preflight-compilers
-          path: .build/preflight-benchmark/
+          name: ssh-producer-${{ matrix.pool }}-${{ matrix.replica }}-${{ github.run_attempt }}
+          path: .build/ssh-producer-control/
+          if-no-files-found: error
           retention-days: 30
-  static-analysis:
+  review:
+    needs: producer
     if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         with:
-          persist-credentials: false
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare anti-slop patch and script runtimes
-        run: node config/scripts/benchmark-preflight-static-analysis.mjs
+          pattern: ssh-producer-*
+          path: receipts
+      - name: Verify all four same-source builds have identical complete manifests
+        run: |
+          python3 - <<'PYREVIEW'
+          import json, os
+          from pathlib import Path
+          receipts = sorted(Path('receipts').glob('*/manifest.json'))
+          assert len(receipts) == 4
+          rows = []
+          for file in receipts:
+              parent = file.parent
+              assert (parent / 'source.txt').read_text().strip() == os.environ['CONTROL_SOURCE']
+              rows.append({'pool': (parent / 'pool.txt').read_text().strip(), 'replica': int((parent / 'replica.txt').read_text()), 'manifest': json.loads(file.read_text()), 'lockfiles': (parent / 'lockfiles.txt').read_text(), 'node': (parent / 'node-version.txt').read_text().strip()})
+          assert {(r['pool'], r['replica']) for r in rows} == {('github', 1), ('github', 2), ('blacksmith', 1), ('blacksmith', 2)}
+          assert all(r['manifest'] == rows[0]['manifest'] for r in rows)
+          assert all(r['lockfiles'] == rows[0]['lockfiles'] and r['node'] == rows[0]['node'] for r in rows)
+          manifest = rows[0]['manifest']
+          Path('comparison.json').write_text(json.dumps({'source': os.environ['CONTROL_SOURCE'], 'allFourCompleteManifestsIdentical': True, 'buildId': manifest['buildId'], 'assetCount': len(manifest['assets']), 'totalBytes': manifest['totalBytes'], 'node': rows[0]['node'], 'limits': 'Two hosts per pool in one scheduling window. Queue observations do not establish day-wide or billing savings. Real Windows consumers and full PR checks are required before production merge.'}, indent=2))
+          PYREVIEW
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: preflight-static-analysis
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  compatibility-imports:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 2
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare compatibility-import scan and runtimes
-        run: node config/scripts/benchmark-preflight-compat-boundary.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-compat-boundary
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  localization-extraction:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare localization extraction runtimes and complete catalogs
-        run: node config/scripts/benchmark-preflight-localization-extraction.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-localization-extraction
-          path: .build/preflight-benchmark/
+          name: ssh-producer-comparison-${{ github.run_attempt }}
+          path: comparison.json
+          if-no-files-found: error
           retention-days: 30
