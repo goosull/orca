@@ -14,98 +14,82 @@ concurrency:
   cancel-in-progress: true
 env:
   ORCA_BACKGROUND_LAUNCH: '1'
+  CONTROL_SOURCE: 758b9c2b7158dd5f6ecd80d3ced7810405bc54c6
+  CONTROL_RECEIPTS: ${{ github.workspace }}/.build/webkit-mirror-control
 jobs:
-  compilers:
+  mobile:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    # Native compiler peaks can exhaust the standard ARM runner before samples are saved.
-    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
-    timeout-minutes: 25
+    name: Delayed mirror (${{ matrix.preparation }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        preparation: [baseline, prepared]
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare native and Bun typechecking
-        run: node config/scripts/benchmark-preflight-compilers.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-compilers
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  static-analysis:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
-    steps:
+          sparse-checkout: .ci-research
+      - name: Preserve diagnostic outside the source checkout
+        run: cp .ci-research/webkit-mirror-control.py /tmp/orca-webkit-mirror-control.py
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.CONTROL_SOURCE }}
           persist-credentials: false
+      - name: Record exact source and runner
+        env:
+          PREPARATION: ${{ matrix.preparation }}
+        run: |
+          mkdir -p "$CONTROL_RECEIPTS"
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          git rev-parse HEAD > "$CONTROL_RECEIPTS/source.txt"
+          printf '%s\n' "$PREPARATION" > "$CONTROL_RECEIPTS/preparation.txt"
+          printf '%s\n' "$ImageOS/$ImageVersion" > "$CONTROL_RECEIPTS/image.txt"
+          sha256sum .github/scripts/prepare-ubuntu-apt.sh > "$CONTROL_RECEIPTS/preparation-sha256.txt"
       - uses: ./.github/actions/install-node-dependencies
         with:
           native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare anti-slop patch and script runtimes
-        run: node config/scripts/benchmark-preflight-static-analysis.mjs
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+      - name: Configure a real Ubuntu mirror with one bounded delay
+        run: |
+          apt-config dump > "$CONTROL_RECEIPTS/apt-config-before.txt"
+          sudo --preserve-env=CONTROL_RECEIPTS python3 /tmp/orca-webkit-mirror-control.py configure
+          sudo --preserve-env=CONTROL_RECEIPTS python3 /tmp/orca-webkit-mirror-control.py serve &
+          for _ in {1..50}; do
+            if curl --fail --silent http://127.0.0.1/control-ready; then exit 0; fi
+            sleep 0.1
+          done
+          exit 1
+      - name: Prepare Ubuntu mirrors and network waits
+        if: matrix.preparation == 'prepared'
+        run: bash .github/scripts/prepare-ubuntu-apt.sh
+      - name: Install WebKit and all system dependencies
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -o pipefail
+          /usr/bin/time -o "$CONTROL_RECEIPTS/install-time.txt" -f '%e' pnpm exec playwright-core install --with-deps webkit 2>&1 | tee "$CONTROL_RECEIPTS/install.log"
+          dpkg-query -W > "$CONTROL_RECEIPTS/installed-packages.txt"
+      - name: Verify actual mirror requests and bypass
+        run: python3 /tmp/orca-webkit-mirror-control.py verify ${{ matrix.preparation }}
+      - uses: ./.github/actions/install-mobile-dependencies
+      - name: Resolve Chrome for the render check
+        run: |
+          chrome="$(command -v google-chrome || command -v google-chrome-stable)"
+          "$chrome" --version > "$CONTROL_RECEIPTS/chrome-version.txt"
+          echo "ORCA_MOBILE_WEB_RENDER_BROWSER=$chrome" >> "$GITHUB_ENV"
+      - name: Build and verify the app bundle
+        run: pnpm run build:mobile-web
+      - name: Unchanged builder, override census and browser checks
+        env:
+          ORCA_MOBILE_WEB_APP_DEPS_REQUIRED: '1'
+        run: node config/scripts/run-mobile-web-app-checks.mjs --reporter=default --reporter=json --outputFile=.build/webkit-mirror-control/browser-results.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: preflight-static-analysis
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  compatibility-imports:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 2
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare compatibility-import scan and runtimes
-        run: node config/scripts/benchmark-preflight-compat-boundary.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-compat-boundary
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  localization-extraction:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare localization extraction runtimes and complete catalogs
-        run: node config/scripts/benchmark-preflight-localization-extraction.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-localization-extraction
-          path: .build/preflight-benchmark/
+          name: webkit-delayed-mirror-${{ matrix.preparation }}-${{ github.run_attempt }}
+          path: .build/webkit-mirror-control/
           retention-days: 30
