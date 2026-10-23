@@ -42,7 +42,6 @@ export function useAutomationRunPageState({
     isLoading,
     automationHostTargetKey,
     automations,
-    selectedAutomationRuns,
     setSelectedAutomationRunPageId,
     setActivePaneTab,
     rerunRunIdsInFlight,
@@ -54,7 +53,7 @@ export function useAutomationRunPageState({
     setIsDetailOpen
   } = local
   const { selected, selectedRow } = list
-  const { selectedRuns, selectedAutomationRunPage } = setup
+  const { selectedRuns, selectedRunsReady, selectedRunsNotice, selectedAutomationRunPage } = setup
 
   useEffect(() => {
     if (!isDetailOpen || pendingAutomationRunNavigation) {
@@ -129,20 +128,15 @@ export function useAutomationRunPageState({
       setPageView('automations')
       return
     }
-    if (
-      selectedAutomationRuns.notice &&
-      selectedAutomationRuns.automationId === pending.automationId
-    ) {
+    if (!selectedRunsReady) {
+      return
+    }
+    if (selectedRunsNotice) {
       setIsDetailOpen(true)
       setActivePaneTab('runs')
       setSelectedAutomationRunPageId(null)
       setPendingAutomationRunNavigation(null)
-      if (pageView === 'run') {
-        setPageView('runs')
-      }
-      return
-    }
-    if (selectedAutomationRuns.automationId !== pending.automationId) {
+      setPageView('automations')
       return
     }
     setIsDetailOpen(true)
@@ -172,11 +166,11 @@ export function useAutomationRunPageState({
     pendingAutomationRunNavigation,
     pageView,
     selectExternalKey,
-    selectedAutomationRuns.automationId,
-    selectedAutomationRuns.notice,
     selectedExternalKey,
     selectedId,
     selectedRuns,
+    selectedRunsReady,
+    selectedRunsNotice,
     setActivePaneTab,
     setIsDetailOpen,
     setPendingAutomationRunNavigation,
